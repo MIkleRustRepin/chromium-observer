@@ -1,0 +1,55 @@
+# Copyright 2026 Chromium Observer Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the Chromium LICENSE file.
+
+assert(is_linux || is_mac)
+
+declare_args() {
+  page_frame_stream_endpoint = "http://127.0.0.1:8765/api/frame"
+}
+
+source_set("browser_tests") {
+  testonly = true
+  sources = [ "page_frame_streamer_browsertest.cc" ]
+  deps = [
+    ":observer",
+    "//base/test:test_support",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/ui/browser_window",
+    "//chrome/test:test_support",
+    "//components/tabs:public",
+    "//content/test:test_support",
+    "//net",
+    "//services/network:test_support",
+    "//skia",
+    "//testing/gtest",
+    "//ui/gfx/codec",
+  ]
+}
+
+source_set("observer") {
+  sources = [
+    "page_frame_streamer.cc",
+    "page_frame_streamer.h",
+  ]
+  defines = [ "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"" ]
+  public_deps = [
+    "//base",
+    "//chrome/browser:main_extra_parts",
+    "//content/public/browser",
+    "//url",
+  ]
+  deps = [
+    "//chrome/browser/net",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/ui/browser_window",
+    "//components/tabs:public",
+    "//components/viz/common",
+    "//net",
+    "//services/network/public/cpp",
+    "//services/network/public/mojom",
+    "//skia",
+    "//ui/base",
+    "//ui/gfx/codec",
+  ]
+}

@@ -1,0 +1,614 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index b58905ddb3..0d687d6947 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1262,6 +1262,10 @@ source_set("core") {
+     "//ui/webui/tracked_element",
+   ]
+ 
++  if (is_linux || is_mac) {
++    deps += [ "//chrome/browser/observer" ]
++  }
++
+   if (!is_android) {
+     public_deps = [
+       "//chrome/browser/ui/omnibox/omnibox_everywhere:impl",
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index cbf3b6c563..c31eb633e8 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -60,6 +60,10 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "extensions/buildflags/buildflags.h"
+ 
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
++#include "chrome/browser/observer/page_frame_streamer.h"
++#endif
++
+ #if BUILDFLAG(ENABLE_DOWNGRADE_PROCESSING)
+ #include "chrome/browser/downgrade/downgrade_manager_delegate_impl.h"  // nogncheck
+ #endif
+@@ -863,6 +867,10 @@ std::unique_ptr<content::BrowserMainParts> ChromeBrowserMainParts::Create(
+       std::make_unique<ChromeBrowserMainExtraPartsOptimizationGuide>());
+ #endif
+ 
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
++  main_parts->AddParts(std::make_unique<observer::PageFrameStreamer>());
++#endif
++
+   // Always add ChromeBrowserMainExtraPartsGpu last to make sure
+   // GpuDataManager initialization could pick up about:flags settings.
+   main_parts->AddParts(std::make_unique<ChromeBrowserMainExtraPartsGpu>());
+diff --git a/chrome/browser/observer/BUILD.gn b/chrome/browser/observer/BUILD.gn
+new file mode 100644
+index 0000000000..fd5a94840a
+--- /dev/null
++++ b/chrome/browser/observer/BUILD.gn
+@@ -0,0 +1,55 @@
++# Copyright 2026 Chromium Observer Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the Chromium LICENSE file.
++
++assert(is_linux || is_mac)
++
++declare_args() {
++  page_frame_stream_endpoint = "http://127.0.0.1:8765/api/frame"
++}
++
++source_set("browser_tests") {
++  testonly = true
++  sources = [ "page_frame_streamer_browsertest.cc" ]
++  deps = [
++    ":observer",
++    "//base/test:test_support",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/test:test_support",
++    "//components/tabs:public",
++    "//content/test:test_support",
++    "//net",
++    "//services/network:test_support",
++    "//skia",
++    "//testing/gtest",
++    "//ui/gfx/codec",
++  ]
++}
++
++source_set("observer") {
++  sources = [
++    "page_frame_streamer.cc",
++    "page_frame_streamer.h",
++  ]
++  defines = [ "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"" ]
++  public_deps = [
++    "//base",
++    "//chrome/browser:main_extra_parts",
++    "//content/public/browser",
++    "//url",
++  ]
++  deps = [
++    "//chrome/browser/net",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//components/tabs:public",
++    "//components/viz/common",
++    "//net",
++    "//services/network/public/cpp",
++    "//services/network/public/mojom",
++    "//skia",
++    "//ui/base",
++    "//ui/gfx/codec",
++  ]
++}
+diff --git a/chrome/browser/observer/page_frame_streamer.cc b/chrome/browser/observer/page_frame_streamer.cc
+new file mode 100644
+index 0000000000..5a71134eac
+--- /dev/null
++++ b/chrome/browser/observer/page_frame_streamer.cc
+@@ -0,0 +1,236 @@
++// Copyright 2026 Chromium Observer Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the Chromium LICENSE file.
++
++#include "chrome/browser/observer/page_frame_streamer.h"
++
++#include <cstddef>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/thread_pool.h"
++#include "base/uuid.h"
++#include "chrome/browser/net/system_network_context_manager.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
++#include "net/base/load_flags.h"
++#include "net/base/request_priority.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/base/base_window.h"
++#include "ui/gfx/codec/jpeg_codec.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace observer {
++namespace {
++
++constexpr base::TimeDelta kInterval = base::Seconds(1);
++constexpr base::TimeDelta kCopyTimeout = base::Milliseconds(500);
++constexpr base::TimeDelta kUploadTimeout = base::Seconds(2);
++constexpr size_t kMaxJpegBytes = 32 * 1024 * 1024;
++
++content::WebContents* SelectedContents() {
++  auto* browser =
++      GlobalBrowserCollection::GetInstance()->GetLastActiveBrowser();
++  if (!browser || browser->IsDeleteScheduled() ||
++      browser->GetProfile()->IsOffTheRecord()) {
++    return nullptr;
++  }
++  auto* window = browser->GetWindow();
++  if (!window || !window->IsVisible() || window->IsMinimized()) {
++    return nullptr;
++  }
++  auto* tab = browser->GetActiveTabInterface();
++  auto* contents = tab ? tab->GetContents() : nullptr;
++  if (!contents || contents->GetVisibility() != content::Visibility::VISIBLE) {
++    return nullptr;
++  }
++  return contents;
++}
++
++std::optional<std::vector<uint8_t>> Encode(SkBitmap bitmap) {
++  return gfx::JPEGCodec::Encode(bitmap, 80);
++}
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("chromium_observer_page_frame", R"(
++      semantics {
++        sender: "Chromium Observer"
++        description:
++          "This dedicated Chromium fork sends a JPEG of the visible active "
++          "page to the owner's observation server."
++        trigger: "Once per second while an eligible browser window is visible."
++        data: "Rendered page pixels, capture time, session ID and frame number."
++        destination: OTHER
++        destination_other: "The observation endpoint configured at build time."
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Enabled automatically in this dedicated observation build."
++        policy_exception_justification:
++          "This is an owner-operated custom browser build for observing an AI agent."
++      }
++    )");
++
++}  // namespace
++
++PageFrameStreamer::PageFrameStreamer()
++    : PageFrameStreamer(GURL(PAGE_FRAME_STREAM_ENDPOINT)) {}
++
++PageFrameStreamer::PageFrameStreamer(const GURL& endpoint)
++    : endpoint_(endpoint),
++      session_(base::Uuid::GenerateRandomV4().AsLowercaseString()) {}
++
++PageFrameStreamer::~PageFrameStreamer() {
++  PostMainMessageLoopRun();
++}
++
++void PageFrameStreamer::PostBrowserStart() {
++  if (timer_.IsRunning() || !endpoint_.SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
++  // The system context is separate from profiles and page storage partitions.
++  factory_ =
++      SystemNetworkContextManager::GetInstance()->GetSharedURLLoaderFactory();
++  timer_.Start(FROM_HERE, kInterval, this, &PageFrameStreamer::Tick);
++}
++
++void PageFrameStreamer::PostMainMessageLoopRun() {
++  timer_.Stop();
++  weak_factory_.InvalidateWeakPtrs();
++  FinishCycle();
++  Observe(nullptr);
++  factory_.reset();
++}
++
++void PageFrameStreamer::FinishCycle() {
++  active_cycle_ = 0;
++  invalidated_ = false;
++  upload_.reset();
++}
++
++void PageFrameStreamer::InvalidateCycle() {
++  if (upload_) {
++    FinishCycle();
++  } else if (active_cycle_ != 0) {
++    // Copy/encoding work cannot be cancelled. Keep the slot occupied until
++    // its callback returns, so repeated navigations cannot queue bitmaps.
++    invalidated_ = true;
++  }
++}
++
++void PageFrameStreamer::Tick() {
++  auto* selected = SelectedContents();
++  if (selected != web_contents()) {
++    InvalidateCycle();
++    Observe(selected);
++  }
++  if (!selected || active_cycle_ != 0) {
++    return;
++  }
++  auto* view = selected->GetRenderWidgetHostView();
++  if (!view || !view->IsShowing() || !view->IsSurfaceAvailableForCopy()) {
++    return;
++  }
++  const uint64_t cycle = ++next_cycle_;
++  active_cycle_ = cycle;
++  view->CopyFromSurface(
++      gfx::Rect(), gfx::Size(), kCopyTimeout,
++      base::BindPostTaskToCurrentDefault(base::BindOnce(
++          &PageFrameStreamer::OnCopied, weak_factory_.GetWeakPtr(), cycle,
++          base::Time::Now())));
++}
++
++bool PageFrameStreamer::IsCurrentCycle(uint64_t cycle) const {
++  return !invalidated_ && active_cycle_ == cycle && web_contents() &&
++         SelectedContents() == web_contents();
++}
++
++void PageFrameStreamer::OnCopied(uint64_t cycle,
++                                 base::Time captured_at,
++                                 const content::CopyFromSurfaceResult& result) {
++  if (active_cycle_ != cycle) {
++    return;
++  }
++  if (!IsCurrentCycle(cycle) || !result.has_value() ||
++      result->bitmap.drawsNothing()) {
++    FinishCycle();
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::TaskPriority::BEST_EFFORT},
++      base::BindOnce(&Encode, result->bitmap),
++      base::BindOnce(&PageFrameStreamer::OnEncoded, weak_factory_.GetWeakPtr(),
++                     cycle, captured_at));
++}
++
++void PageFrameStreamer::OnEncoded(uint64_t cycle,
++                                  base::Time captured_at,
++                                  std::optional<std::vector<uint8_t>> jpeg) {
++  if (active_cycle_ != cycle) {
++    return;
++  }
++  if (!IsCurrentCycle(cycle) || !jpeg || jpeg->empty() ||
++      jpeg->size() > kMaxJpegBytes) {
++    FinishCycle();
++    return;
++  }
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = endpoint_;
++  request->method = "POST";
++  request->priority = net::IDLE;
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->redirect_mode = network::mojom::RedirectMode::kError;
++  request->load_flags = net::LOAD_DISABLE_CACHE | net::LOAD_BYPASS_CACHE;
++  request->do_not_prompt_for_login = true;
++  request->headers.SetHeader("X-Frame-Session", session_);
++  request->headers.SetHeader("X-Frame-Sequence", base::NumberToString(cycle));
++  request->headers.SetHeader(
++      "X-Captured-At",
++      base::NumberToString(
++          (captured_at - base::Time::UnixEpoch()).InMilliseconds()));
++  upload_ =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  upload_->SetTimeoutDuration(kUploadTimeout);
++  upload_->AttachStringForUpload(
++      std::string(reinterpret_cast<const char*>(jpeg->data()), jpeg->size()),
++      "image/jpeg");
++  upload_->DownloadHeadersOnly(
++      factory_.get(), base::BindOnce(&PageFrameStreamer::OnUploaded,
++                                     weak_factory_.GetWeakPtr(), cycle));
++}
++
++void PageFrameStreamer::OnUploaded(
++    uint64_t cycle,
++    scoped_refptr<net::HttpResponseHeaders> headers) {
++  if (active_cycle_ == cycle) {
++    FinishCycle();
++  }
++}
++
++void PageFrameStreamer::DidStartNavigation(
++    content::NavigationHandle* navigation) {
++  if (navigation->IsInPrimaryMainFrame()) {
++    InvalidateCycle();
++  }
++}
++
++void PageFrameStreamer::WebContentsDestroyed() {
++  InvalidateCycle();
++  Observe(nullptr);
++}
++
++}  // namespace observer
+diff --git a/chrome/browser/observer/page_frame_streamer.h b/chrome/browser/observer/page_frame_streamer.h
+new file mode 100644
+index 0000000000..447c61b69c
+--- /dev/null
++++ b/chrome/browser/observer/page_frame_streamer.h
+@@ -0,0 +1,76 @@
++// Copyright 2026 Chromium Observer Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the Chromium LICENSE file.
++
++#ifndef CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
++#define CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/chrome_browser_main_extra_parts.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "url/gurl.h"
++
++namespace net {
++class HttpResponseHeaders;
++}
++namespace network {
++class SharedURLLoaderFactory;
++class SimpleURLLoader;
++}  // namespace network
++
++namespace observer {
++
++// Browser-process-only capture. Nothing is installed into renderer contexts.
++class PageFrameStreamer : public ChromeBrowserMainExtraParts,
++                          public content::WebContentsObserver {
++ public:
++  PageFrameStreamer();
++  explicit PageFrameStreamer(const GURL& endpoint);
++  ~PageFrameStreamer() override;
++
++  void PostBrowserStart() override;
++  void PostMainMessageLoopRun() override;
++
++ private:
++  friend class PageFrameStreamerBrowserTest;
++
++  void Tick();
++  void InvalidateCycle();
++  void FinishCycle();
++  bool IsCurrentCycle(uint64_t cycle) const;
++  void OnCopied(uint64_t cycle,
++                base::Time captured_at,
++                const content::CopyFromSurfaceResult& result);
++  void OnEncoded(uint64_t cycle,
++                 base::Time captured_at,
++                 std::optional<std::vector<uint8_t>> jpeg);
++  void OnUploaded(uint64_t cycle,
++                  scoped_refptr<net::HttpResponseHeaders> headers);
++
++  void DidStartNavigation(content::NavigationHandle* navigation) override;
++  void WebContentsDestroyed() override;
++
++  const GURL endpoint_;
++  const std::string session_;
++  uint64_t next_cycle_ = 0;
++  uint64_t active_cycle_ = 0;
++  bool invalidated_ = false;
++  base::RepeatingTimer timer_;
++  scoped_refptr<network::SharedURLLoaderFactory> factory_;
++  std::unique_ptr<network::SimpleURLLoader> upload_;
++  base::WeakPtrFactory<PageFrameStreamer> weak_factory_{this};
++};
++
++}  // namespace observer
++
++#endif  // CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
+diff --git a/chrome/browser/observer/page_frame_streamer_browsertest.cc b/chrome/browser/observer/page_frame_streamer_browsertest.cc
+new file mode 100644
+index 0000000000..19b7973193
+--- /dev/null
++++ b/chrome/browser/observer/page_frame_streamer_browsertest.cc
+@@ -0,0 +1,166 @@
++// Copyright 2026 Chromium Observer Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the Chromium LICENSE file.
++
++#include "chrome/browser/observer/page_frame_streamer.h"
++
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/run_loop.h"
++#include "base/test/run_until.h"
++#include "base/test/scoped_run_loop_timeout.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/browser_test.h"
++#include "content/public/test/browser_test_utils.h"
++#include "net/http/http_status_code.h"
++#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
++#include "services/network/test/test_url_loader_factory.h"
++#include "services/network/test/test_utils.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/gfx/codec/jpeg_codec.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace observer {
++
++class PageFrameStreamerBrowserTest : public InProcessBrowserTest {
++ protected:
++  void SetUpOnMainThread() override {
++    ASSERT_TRUE(ui_test_utils::NavigateToURL(
++        browser(), GURL("data:text/html,<body "
++                        "style='margin:0;background:rgb(20,80,200)'>")));
++    contents_ = browser()->GetActiveTabInterface()->GetContents();
++    content::WaitForCopyableViewInWebContents(contents_);
++    streamer_ = std::make_unique<PageFrameStreamer>(endpoint_);
++    streamer_->PostBrowserStart();
++    // Tests advance individual ticks without depending on wall-clock timing.
++    streamer_->timer_.Stop();
++    streamer_->factory_ = factory_.GetSafeWeakWrapper();
++    factory_.SetInterceptor(base::BindRepeating(
++        [](int* count, const network::ResourceRequest&) { ++*count; },
++        &requests_));
++  }
++
++  void TearDownOnMainThread() override {
++    streamer_.reset();
++    contents_ = nullptr;
++  }
++
++  void Tick() { streamer_->Tick(); }
++  bool Idle() const { return streamer_->active_cycle_ == 0; }
++  void WaitForRequests(int count) {
++    base::test::ScopedRunLoopTimeout timeout(FROM_HERE, base::Seconds(15));
++    ASSERT_TRUE(base::test::RunUntil([&] { return requests_ >= count; }));
++  }
++  uint64_t BeginSyntheticCapture(content::WebContents* contents) {
++    streamer_->Observe(contents);
++    const auto cycle = ++streamer_->next_cycle_;
++    streamer_->active_cycle_ = cycle;
++    return cycle;
++  }
++  void DeliverEncoding(uint64_t cycle) {
++    streamer_->OnEncoded(cycle, base::Time::Now(),
++                         std::vector<uint8_t>{0xff, 0xd8, 0xff, 0xd9});
++  }
++
++  const GURL endpoint_{"http://127.0.0.1:18766/api/frame"};
++  network::TestURLLoaderFactory factory_;
++  int requests_ = 0;
++  raw_ptr<content::WebContents> contents_ = nullptr;
++  std::unique_ptr<PageFrameStreamer> streamer_;
++};
++
++IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
++                       CapturesPagePixelsWithoutCredentials) {
++  Tick();
++  WaitForRequests(1);
++  auto* pending = factory_.GetPendingRequest(0);
++  ASSERT_TRUE(pending);
++  const auto& request = pending->request;
++  EXPECT_EQ("POST", request.method);
++  EXPECT_EQ(network::mojom::CredentialsMode::kOmit, request.credentials_mode);
++  EXPECT_EQ(network::mojom::RedirectMode::kError, request.redirect_mode);
++  EXPECT_TRUE(request.headers.HasHeader("X-Frame-Session"));
++  EXPECT_TRUE(request.headers.HasHeader("X-Frame-Sequence"));
++  EXPECT_TRUE(request.headers.HasHeader("X-Captured-At"));
++  const std::string bytes = network::GetUploadData(request);
++  SkBitmap bitmap = gfx::JPEGCodec::Decode(base::as_byte_span(bytes));
++  ASSERT_FALSE(bitmap.drawsNothing());
++  const auto size =
++      contents_->GetRenderWidgetHostView()->GetVisibleViewportSizeDevicePx();
++  EXPECT_EQ(size.width(), bitmap.width());
++  EXPECT_EQ(size.height(), bitmap.height());
++  const SkColor center =
++      bitmap.getColor(bitmap.width() / 2, bitmap.height() / 2);
++  EXPECT_NEAR(20, SkColorGetR(center), 5);
++  EXPECT_NEAR(80, SkColorGetG(center), 5);
++  EXPECT_NEAR(200, SkColorGetB(center), 5);
++}
++
++IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
++                       SlowUploadSkipsTicksAndErrorAllowsRecovery) {
++  Tick();
++  WaitForRequests(1);
++  Tick();
++  Tick();
++  Tick();
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(1, requests_);
++  ASSERT_TRUE(factory_.SimulateResponseForPendingRequest(
++      endpoint_.spec(), "", net::HTTP_SERVICE_UNAVAILABLE));
++  ASSERT_TRUE(base::test::RunUntil([&] { return Idle(); }));
++  Tick();
++  WaitForRequests(2);
++}
++
++IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
++                       NavigationDiscardsOldEncoding) {
++  const uint64_t cycle = BeginSyntheticCapture(contents_);
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      browser(),
++      GURL("data:text/html,<body style='background:green'>new page")));
++  // Invalidation must keep the old encoding slot occupied until its reply.
++  Tick();
++  EXPECT_FALSE(Idle());
++  EXPECT_EQ(0, requests_);
++  DeliverEncoding(cycle);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(0, requests_);
++  EXPECT_TRUE(Idle());
++  content::WaitForCopyableViewInWebContents(contents_);
++  Tick();
++  WaitForRequests(1);
++}
++
++IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
++                       DestroyedContentsDiscardsOldEncoding) {
++  auto temporary = content::WebContents::Create(
++      content::WebContents::CreateParams(browser()->GetProfile()));
++  const uint64_t cycle = BeginSyntheticCapture(temporary.get());
++  temporary.reset();
++  DeliverEncoding(cycle);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(0, requests_);
++  EXPECT_TRUE(Idle());
++  Tick();
++  WaitForRequests(1);
++}
++
++IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
++                       ShutdownCancelsPendingUpload) {
++  Tick();
++  WaitForRequests(1);
++  streamer_->PostMainMessageLoopRun();
++  base::RunLoop().RunUntilIdle();
++  EXPECT_TRUE(Idle());
++  EXPECT_EQ(1, requests_);
++}
++
++}  // namespace observer
+diff --git a/chrome/test/BUILD.gn b/chrome/test/BUILD.gn
+index 167b043f9a..297f61e222 100644
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -4235,7 +4235,10 @@ if (!is_android) {
+ 
+     if (is_linux || is_mac) {
+       sources += [ "../browser/ui/views/first_run_dialog_browsertest.cc" ]
+-      deps += [ "//chrome/browser/ui/views:first_run_dialog" ]
++      deps += [
++        "//chrome/browser/observer:browser_tests",
++        "//chrome/browser/ui/views:first_run_dialog",
++      ]
+     }
+     if (is_linux) {
+       sources += [ "../browser/ui/views/eula_dialog_linux_browsertest.cc" ]

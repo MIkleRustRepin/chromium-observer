@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Frame capture test</title>
+<style>
+body { font: 24px system-ui; margin: 40px; background: #eaf1ff; }
+#clock { font: bold 48px monospace; }
+.box { width: 100px; height: 100px; background: #1456d8; animation: move 3s infinite alternate; }
+@keyframes move { to { transform: translateX(400px) rotate(90deg); background: #d84527; } }
+section { height: 900px; padding-top: 20px; }
+</style>
+<h1>Rendered frame test</h1>
+<div id="clock"></div>
+<div class="box"></div>
+<section><p>Scroll to verify viewport capture.</p><input placeholder="Type here"></section>
+<h2>Bottom of the page</h2>
+<script>
+setInterval(() => document.querySelector('#clock').textContent = new Date().toISOString(), 100);
+</script>

@@ -1,0 +1,7 @@
+chromium/
+tools/depot_tools/
+__pycache__/
+*.pyc
+logs/
+artifacts/
+.codebase-memory/

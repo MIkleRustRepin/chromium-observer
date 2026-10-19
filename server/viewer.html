@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chromium — наблюдение</title>
+<style>
+  body { margin: 0; background: #17191d; color: #eef0f4; font: 16px system-ui, sans-serif; }
+  header { padding: 16px 24px; display: flex; gap: 24px; flex-wrap: wrap; align-items: baseline; }
+  h1 { margin: 0; font-size: 20px; }
+  #status { color: #f0c66b; }
+  #status.live { color: #8fdda6; }
+  #details { color: #aab0bb; font-size: 14px; }
+  main { padding: 0 24px 24px; }
+  img { display: block; max-width: 100%; height: auto; margin: auto; background: #252830; }
+</style>
+<header>
+  <h1>Chromium</h1>
+  <span id="status" role="status">Ожидание первого кадра</span>
+  <span id="details"></span>
+</header>
+<main><img id="frame" alt="Последний кадр страницы" hidden></main>
+<script>
+  const picture = document.querySelector('#frame');
+  const status = document.querySelector('#status');
+  const details = document.querySelector('#details');
+  let received = 0, captured = 0, sequence = 0, key = '', objectURL;
+  function updateStatus() {
+    if (!received) return;
+    const age = Math.max(0, (Date.now() - captured) / 1000);
+    const live = Date.now() - received <= 3000 && age <= 3;
+    status.textContent = live ? 'Обновляется' : 'Нет свежих кадров';
+    status.classList.toggle('live', live);
+    details.textContent = `Кадр ${sequence} · ${new Date(captured).toLocaleTimeString()} · возраст ${age.toFixed(1)} с`;
+  }
+  async function poll() {
+    const started = performance.now();
+    try {
+      const response = await fetch('/api/frame', {cache: 'no-store', signal: AbortSignal.timeout(2500)});
+      if (response.status === 200) {
+        const nextKey = response.headers.get('X-Frame-Session') + ':' + response.headers.get('X-Frame-Sequence');
+        if (nextKey !== key) {
+          const nextURL = URL.createObjectURL(await response.blob());
+          const decoded = new Image();
+          decoded.src = nextURL;
+          try { await decoded.decode(); }
+          catch (error) { URL.revokeObjectURL(nextURL); throw error; }
+          picture.src = nextURL;
+          picture.hidden = false;
+          if (objectURL) URL.revokeObjectURL(objectURL);
+          objectURL = nextURL;
+          key = nextKey;
+          sequence = Number(response.headers.get('X-Frame-Sequence'));
+          captured = Number(response.headers.get('X-Captured-At'));
+          received = Number(response.headers.get('X-Received-At'));
+        } else {
+          await response.body.cancel();
+        }
+      } else if (!received) {
+        status.textContent = response.status === 204 ? 'Ожидание первого кадра' : 'Сервер недоступен';
+      }
+    } catch {
+      if (!received) status.textContent = 'Сервер недоступен';
+    } finally {
+      updateStatus();
+      setTimeout(poll, Math.max(0, 1000 - (performance.now() - started)));
+    }
+  }
+  setInterval(updateStatus, 200);
+  poll();
+</script>
+</html>
