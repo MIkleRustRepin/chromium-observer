@@ -11,6 +11,8 @@ import sys
 import time
 from urllib.parse import urlparse
 
+from devtools_types import prepare_devtools_types
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "chromium" / "src"
 parser = argparse.ArgumentParser(description=__doc__)
@@ -31,6 +33,7 @@ if shutil.disk_usage(ROOT).free < 15 * 1024**3:
     sys.exit("Need at least 15 GiB of free disk before starting the build.")
 if not (SRC / "chrome/browser/observer/page_frame_streamer.cc").is_file():
     sys.exit("Apply the observer patch before building (scripts/apply_patch.py).")
+prepare_devtools_types(SRC)
 config = ["is_debug = false", "is_component_build = false", "is_official_build = false",
           "symbol_level = 0", "blink_symbol_level = 0", "v8_symbol_level = 0",
           "use_remoteexec = false", "use_siso = false", "concurrent_links = 1",
