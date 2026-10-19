@@ -48,21 +48,32 @@ chromium/src/out/Observer/chrome --user-data-dir="$PWD/artifacts/agent-profile"
 
 ## macOS Apple Silicon
 
-Сборку выполнять на Mac с Xcode и SDK, требуемыми закреплённой версией Chromium. Linux не создаёт проверенную macOS-сборку.
+Установить **полную Xcode** из Mac App Store и открыть её один раз, чтобы принять лицензию и установить компоненты. Затем на Mac Studio / Mini с Apple Silicon запустить:
 
 ```bash
-xcode-select --install
-python3 scripts/bootstrap.py
-export PATH="$PWD/tools/depot_tools:$PATH"
-export DEPOT_TOOLS_UPDATE=0
-(cd chromium/src && gclient runhooks)
-python3 scripts/apply_patch.py
-python3 scripts/build.py
-python3 scripts/package.py
-python3 -m server.server
+./build-mac.sh
 ```
 
-Запускать `chromium/src/out/Observer/Chromium.app/Contents/MacOS/Chromium` с отдельным `--user-data-dir`. Архив содержит локальную сборку; подпись Developer ID и notarization в задачу не входят.
+Скрипт сам скачает закреплённые Chromium, `depot_tools`, зависимости и Python для сборки, выполнит hooks, применит патч, соберёт `Chromium.app` для arm64 и создаст `artifacts/chromium-observer-macos-arm64.tar.gz`. Homebrew не нужен. Начальный запуск использует Python 3.9+ из Xcode command-line tools; дальнейшие этапы — закреплённый Python из `depot_tools`.
+
+Можно скачать только консольный скрипт — он сам клонирует этот проект в `~/chromium-observer`:
+
+```bash
+curl -fL https://raw.githubusercontent.com/MIkleRustRepin/chromium-observer/main/build-mac.sh -o /tmp/chromium-observer-build-mac.sh
+bash /tmp/chromium-observer-build-mac.sh
+```
+
+Нужны APFS и минимум 100 ГиБ свободного диска для первого запуска; рекомендуется 150 ГиБ и больше. Путь к проекту должен быть без пробелов. Число заданий выбирается по RAM/CPU; Mac не уходит в сон во время работы. Повторный запуск использует скачанные файлы и результаты компиляции. Логи сохраняются в `logs/build-mac-*.log`.
+
+```bash
+./build-mac.sh --jobs 4
+./build-mac.sh --endpoint http://127.0.0.1:8765/api/frame
+./build-mac.sh --clean  # пересоздать только артефакты out/Observer
+```
+
+Для другого каталога при запуске отдельного скачанного скрипта задать `CHROMIUM_OBSERVER_DIR`. При нестандартном расположении Xcode можно задать `DEVELOPER_DIR`. `--tests` дополнительно собирает browser tests; автоматически они не запускаются.
+
+Запускать `chromium/src/out/Observer/Chromium.app/Contents/MacOS/Chromium` с отдельным `--user-data-dir`. Сервер: `tools/depot_tools/python-bin/python3 -m server.server`. Архив содержит локальную сборку; подпись Developer ID и notarization в задачу не входят. Фактическая сборка на macOS пока не проверена.
 
 ## Поведение и настройки
 
