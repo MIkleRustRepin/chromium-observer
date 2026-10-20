@@ -2,6 +2,7 @@
 """Build this fork natively, stopping if disk reserve falls below 5 GiB."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,10 +20,14 @@ SRC = ROOT / "chromium" / "src"
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--jobs", type=int, default=2)
 parser.add_argument("--endpoint", default="http://127.0.0.1:8765/api/frame")
+parser.add_argument("--scale", type=float, default=1.0,
+                    help="Frame width/height relative to rendered pixels, 0 < scale <= 1 (default: 1.0)")
 parser.add_argument("--tests", action="store_true", help="Also build browser_tests")
 parser.add_argument("--target", action="append", help="Build a specific Ninja target instead of chrome")
 parser.add_argument("--generate-only", action="store_true", help="Validate/generate GN configuration without compiling")
 args = parser.parse_args()
+if not math.isfinite(args.scale) or not 0 < args.scale <= 1:
+    parser.error("--scale must be greater than 0 and at most 1")
 endpoint = urlparse(args.endpoint)
 if endpoint.scheme not in ("http", "https") or not endpoint.hostname or any(c in args.endpoint for c in '\\"\n\r'):
     sys.exit("Endpoint must be an HTTP(S) URL without quotes or escapes.")
@@ -38,7 +43,8 @@ prepare_devtools_types(SRC)
 config = ["is_debug = false", "is_component_build = false", "is_official_build = false",
           "symbol_level = 0", "blink_symbol_level = 0", "v8_symbol_level = 0",
           "use_remoteexec = false", "use_siso = false", "concurrent_links = 1",
-          'page_frame_stream_endpoint = ' + json.dumps(args.endpoint)]
+          'page_frame_stream_endpoint = ' + json.dumps(args.endpoint),
+          'page_frame_stream_scale = ' + json.dumps(str(args.scale))]
 if sys.platform == "darwin":
     config.append('target_cpu = "arm64"')
 else:

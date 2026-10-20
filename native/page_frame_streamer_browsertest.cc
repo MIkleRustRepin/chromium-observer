@@ -27,6 +27,7 @@
 #include "third_party/skia/include/core/SkColor.h"
 #include "ui/gfx/codec/jpeg_codec.h"
 #include "ui/gfx/geometry/size.h"
+#include "ui/gfx/geometry/size_conversions.h"
 
 namespace observer {
 
@@ -93,8 +94,10 @@ IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
   const std::string bytes = network::GetUploadData(request);
   SkBitmap bitmap = gfx::JPEGCodec::Decode(base::as_byte_span(bytes));
   ASSERT_FALSE(bitmap.drawsNothing());
-  const auto size =
-      contents_->GetRenderWidgetHostView()->GetVisibleViewportSizeDevicePx();
+  auto size = gfx::ScaleToRoundedSize(
+      contents_->GetRenderWidgetHostView()->GetVisibleViewportSizeDevicePx(),
+      static_cast<float>(PAGE_FRAME_STREAM_SCALE));
+  size.SetToMax(gfx::Size(1, 1));
   EXPECT_EQ(size.width(), bitmap.width());
   EXPECT_EQ(size.height(), bitmap.height());
   const SkColor center =

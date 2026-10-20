@@ -6,11 +6,15 @@ assert(is_linux || is_mac)
 
 declare_args() {
   page_frame_stream_endpoint = "http://127.0.0.1:8765/api/frame"
+
+  # GN has no floating-point values; pass the numeric scale as a string.
+  page_frame_stream_scale = "1.0"
 }
 
 source_set("browser_tests") {
   testonly = true
   sources = [ "page_frame_streamer_browsertest.cc" ]
+  defines = [ "PAGE_FRAME_STREAM_SCALE=$page_frame_stream_scale" ]
   deps = [
     ":observer",
     "//base/test:test_support",
@@ -32,7 +36,10 @@ source_set("observer") {
     "page_frame_streamer.cc",
     "page_frame_streamer.h",
   ]
-  defines = [ "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"" ]
+  defines = [
+    "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"",
+    "PAGE_FRAME_STREAM_SCALE=$page_frame_stream_scale",
+  ]
   public_deps = [
     "//base",
     "//chrome/browser:main_extra_parts",

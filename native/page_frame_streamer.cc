@@ -33,6 +33,7 @@
 #include "ui/gfx/codec/jpeg_codec.h"
 #include "ui/gfx/geometry/rect.h"
 #include "ui/gfx/geometry/size.h"
+#include "ui/gfx/geometry/size_conversions.h"
 
 namespace observer {
 namespace {
@@ -41,6 +42,8 @@ constexpr base::TimeDelta kInterval = base::Seconds(1);
 constexpr base::TimeDelta kCopyTimeout = base::Milliseconds(500);
 constexpr base::TimeDelta kUploadTimeout = base::Seconds(2);
 constexpr size_t kMaxJpegBytes = 32 * 1024 * 1024;
+constexpr double kFrameScale = PAGE_FRAME_STREAM_SCALE;
+static_assert(kFrameScale > 0 && kFrameScale <= 1);
 
 content::WebContents* SelectedContents() {
   auto* browser =
@@ -145,10 +148,20 @@ void PageFrameStreamer::Tick() {
   if (!view || !view->IsShowing() || !view->IsSurfaceAvailableForCopy()) {
     return;
   }
+  gfx::Size output_size;
+  if constexpr (kFrameScale < 1) {
+    const auto native_size = view->GetVisibleViewportSizeDevicePx();
+    if (native_size.IsEmpty()) {
+      return;
+    }
+    output_size =
+        gfx::ScaleToRoundedSize(native_size, static_cast<float>(kFrameScale));
+    output_size.SetToMax(gfx::Size(1, 1));
+  }
   const uint64_t cycle = ++next_cycle_;
   active_cycle_ = cycle;
   view->CopyFromSurface(
-      gfx::Rect(), gfx::Size(), kCopyTimeout,
+      gfx::Rect(), output_size, kCopyTimeout,
       base::BindPostTaskToCurrentDefault(base::BindOnce(
           &PageFrameStreamer::OnCopied, weak_factory_.GetWeakPtr(), cycle,
           base::Time::Now())));

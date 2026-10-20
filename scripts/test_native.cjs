@@ -12,6 +12,8 @@ const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
 const executable = process.env.TEST_BROWSER || path.join(root, 'chromium/src/out/Observer/chrome');
 const base = 'http://127.0.0.1:8765';
+const scale = Number(process.env.TEST_FRAME_SCALE || '1.0');
+assert(Number.isFinite(scale) && scale > 0 && scale <= 1, 'Invalid TEST_FRAME_SCALE');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let server, browser, context, wm, fixture, profile;
 
@@ -67,8 +69,8 @@ const matches = (actual, expected) => actual.every((value, i) => Math.abs(value 
   await page.setContent('<body style="margin:0;background:rgb(20,80,200)">');
   await page.bringToFront();
   let current = await waitFrame(f => matches(f.color, [20,80,200]));
-  assert.equal(current.width, 900);
-  assert.equal(current.height, 600);
+  assert.equal(current.width, Math.max(1, Math.round(900 * scale)));
+  assert.equal(current.height, Math.max(1, Math.round(600 * scale)));
   assert(Date.now() - current.captured < 2500);
   const samples = [];
   for (let i = 0; i < 6; ++i) {
@@ -116,7 +118,7 @@ const matches = (actual, expected) => actual.every((value, i) => Math.abs(value 
   current = await waitFrame(f => matches(f.color, [160,20,200]));
   fs.mkdirSync(path.join(root, 'artifacts'), {recursive: true});
   fs.writeFileSync(path.join(root, 'artifacts/native-last-frame.jpg'), current.bytes);
-  const result = {passed: true, cadence_ms: samples, viewport: [current.width, current.height],
+  const result = {passed: true, cadence_ms: samples, scale, viewport: [current.width, current.height],
     final_frame_age_ms: Date.now() - current.captured,
     checks: ['rendered pixels', 'viewport dimensions', '1 Hz cadence', 'scroll', 'tab switch', 'tab close', 'cross-origin iframe', 'minimize/restore', 'server restart'],
     binary: executable};

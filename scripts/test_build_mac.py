@@ -86,18 +86,29 @@ esac''')
         self.assertEqual([
             "python scripts/bootstrap.py", "gclient runhooks",
             "python scripts/apply_patch.py",
-            "python scripts/build.py --jobs 2 --endpoint http://127.0.0.1:8765/api/frame",
+            "python scripts/build.py --jobs 2 --endpoint http://127.0.0.1:8765/api/frame --scale 0.75",
             "python scripts/package.py",
         ], self.trace.read_text().splitlines())
         self.assertTrue((self.repo / "artifacts/chromium-observer-macos-arm64.tar.gz").exists())
         self.assertFalse((self.repo / ".mac-build.lock").exists())
         self.trace.write_text("")
         (self.repo / "chromium/src/out/Observer/build.ninja").touch()
-        result = self.run_script("--jobs", "4", "--endpoint", "http://127.0.0.1:9999/api/frame", "--tests", "--clean")
+        result = self.run_script("--jobs", "4", "--endpoint", "http://127.0.0.1:9999/api/frame", "--scale", "0.5", "--tests", "--clean")
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         calls = self.trace.read_text().splitlines()
         self.assertIn("gn clean out/Observer", calls)
-        self.assertIn("python scripts/build.py --jobs 4 --endpoint http://127.0.0.1:9999/api/frame --tests", calls)
+        self.assertIn("python scripts/build.py --jobs 4 --endpoint http://127.0.0.1:9999/api/frame --scale 0.5 --tests", calls)
+
+    def test_bad_scale_rejected_before_downloads(self):
+        for value in ("0", "-0.5", "1.01", "nan", "inf", "bad"):
+            with self.subTest(scale=value):
+                result = self.run_script("--scale", value)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("--scale", result.stderr)
+                self.assertFalse(self.trace.exists())
+        result = self.run_script("--scale")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--scale needs", result.stderr)
 
     def test_failed_hook_stops_build_and_unlocks_for_retry(self):
         result = self.run_script(extra_env={"FAIL_HOOKS": "23"})

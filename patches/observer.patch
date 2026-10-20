@@ -41,10 +41,10 @@ index cbf3b6c563..c31eb633e8 100644
    main_parts->AddParts(std::make_unique<ChromeBrowserMainExtraPartsGpu>());
 diff --git a/chrome/browser/observer/BUILD.gn b/chrome/browser/observer/BUILD.gn
 new file mode 100644
-index 0000000000..fd5a94840a
+index 0000000000..551507d897
 --- /dev/null
 +++ b/chrome/browser/observer/BUILD.gn
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,62 @@
 +# Copyright 2026 Chromium Observer Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the Chromium LICENSE file.
@@ -53,11 +53,15 @@ index 0000000000..fd5a94840a
 +
 +declare_args() {
 +  page_frame_stream_endpoint = "http://127.0.0.1:8765/api/frame"
++
++  # GN has no floating-point values; pass the numeric scale as a string.
++  page_frame_stream_scale = "1.0"
 +}
 +
 +source_set("browser_tests") {
 +  testonly = true
 +  sources = [ "page_frame_streamer_browsertest.cc" ]
++  defines = [ "PAGE_FRAME_STREAM_SCALE=$page_frame_stream_scale" ]
 +  deps = [
 +    ":observer",
 +    "//base/test:test_support",
@@ -79,7 +83,10 @@ index 0000000000..fd5a94840a
 +    "page_frame_streamer.cc",
 +    "page_frame_streamer.h",
 +  ]
-+  defines = [ "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"" ]
++  defines = [
++    "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"",
++    "PAGE_FRAME_STREAM_SCALE=$page_frame_stream_scale",
++  ]
 +  public_deps = [
 +    "//base",
 +    "//chrome/browser:main_extra_parts",
@@ -102,10 +109,10 @@ index 0000000000..fd5a94840a
 +}
 diff --git a/chrome/browser/observer/page_frame_streamer.cc b/chrome/browser/observer/page_frame_streamer.cc
 new file mode 100644
-index 0000000000..5a71134eac
+index 0000000000..08a78b11dd
 --- /dev/null
 +++ b/chrome/browser/observer/page_frame_streamer.cc
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,249 @@
 +// Copyright 2026 Chromium Observer Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the Chromium LICENSE file.
@@ -141,6 +148,7 @@ index 0000000000..5a71134eac
 +#include "ui/gfx/codec/jpeg_codec.h"
 +#include "ui/gfx/geometry/rect.h"
 +#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/geometry/size_conversions.h"
 +
 +namespace observer {
 +namespace {
@@ -149,6 +157,8 @@ index 0000000000..5a71134eac
 +constexpr base::TimeDelta kCopyTimeout = base::Milliseconds(500);
 +constexpr base::TimeDelta kUploadTimeout = base::Seconds(2);
 +constexpr size_t kMaxJpegBytes = 32 * 1024 * 1024;
++constexpr double kFrameScale = PAGE_FRAME_STREAM_SCALE;
++static_assert(kFrameScale > 0 && kFrameScale <= 1);
 +
 +content::WebContents* SelectedContents() {
 +  auto* browser =
@@ -253,10 +263,20 @@ index 0000000000..5a71134eac
 +  if (!view || !view->IsShowing() || !view->IsSurfaceAvailableForCopy()) {
 +    return;
 +  }
++  gfx::Size output_size;
++  if constexpr (kFrameScale < 1) {
++    const auto native_size = view->GetVisibleViewportSizeDevicePx();
++    if (native_size.IsEmpty()) {
++      return;
++    }
++    output_size =
++        gfx::ScaleToRoundedSize(native_size, static_cast<float>(kFrameScale));
++    output_size.SetToMax(gfx::Size(1, 1));
++  }
 +  const uint64_t cycle = ++next_cycle_;
 +  active_cycle_ = cycle;
 +  view->CopyFromSurface(
-+      gfx::Rect(), gfx::Size(), kCopyTimeout,
++      gfx::Rect(), output_size, kCopyTimeout,
 +      base::BindPostTaskToCurrentDefault(base::BindOnce(
 +          &PageFrameStreamer::OnCopied, weak_factory_.GetWeakPtr(), cycle,
 +          base::Time::Now())));
@@ -426,10 +446,10 @@ index 0000000000..447c61b69c
 +#endif  // CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
 diff --git a/chrome/browser/observer/page_frame_streamer_browsertest.cc b/chrome/browser/observer/page_frame_streamer_browsertest.cc
 new file mode 100644
-index 0000000000..19b7973193
+index 0000000000..d36e18b9e8
 --- /dev/null
 +++ b/chrome/browser/observer/page_frame_streamer_browsertest.cc
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,169 @@
 +// Copyright 2026 Chromium Observer Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the Chromium LICENSE file.
@@ -459,6 +479,7 @@ index 0000000000..19b7973193
 +#include "third_party/skia/include/core/SkColor.h"
 +#include "ui/gfx/codec/jpeg_codec.h"
 +#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/geometry/size_conversions.h"
 +
 +namespace observer {
 +
@@ -525,8 +546,10 @@ index 0000000000..19b7973193
 +  const std::string bytes = network::GetUploadData(request);
 +  SkBitmap bitmap = gfx::JPEGCodec::Decode(base::as_byte_span(bytes));
 +  ASSERT_FALSE(bitmap.drawsNothing());
-+  const auto size =
-+      contents_->GetRenderWidgetHostView()->GetVisibleViewportSizeDevicePx();
++  auto size = gfx::ScaleToRoundedSize(
++      contents_->GetRenderWidgetHostView()->GetVisibleViewportSizeDevicePx(),
++      static_cast<float>(PAGE_FRAME_STREAM_SCALE));
++  size.SetToMax(gfx::Size(1, 1));
 +  EXPECT_EQ(size.width(), bitmap.width());
 +  EXPECT_EQ(size.height(), bitmap.height());
 +  const SkColor center =
