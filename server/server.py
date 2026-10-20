@@ -8,10 +8,12 @@ from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 from pathlib import Path
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .udp_transport import MAX_FRAME_BYTES, UdpReceiver
 
@@ -60,6 +62,7 @@ class ViewerServer(ThreadingHTTPServer):
         self.store = FrameStore()
         self.page = Path(__file__).with_name("viewer.html").read_bytes()
         super().__init__(address, Handler)
+        self.public_viewer = not ipaddress.ip_address(self.server_address[0]).is_loopback
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -93,21 +96,37 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def local_request(self):
-        # Reject DNS rebinding and cross-origin writes from visited pages.
+    def allowed_request(self):
+        host = self.headers.get("Host", "")
         allowed = {f"127.0.0.1:{self.server.server_port}",
-                   f"localhost:{self.server.server_port}"}
-        if self.headers.get("Host") not in allowed:
+                   f"localhost:{self.server.server_port}",
+                   f"{self.server.server_address[0]}:{self.server.server_port}"}
+        if self.server.public_viewer:
+            # A public listener accepts its public IP or DNS name, including
+            # deployments whose public address is mapped through NAT.
+            try:
+                authority = urlsplit("http://" + host)
+                if (not host or any(c.isspace() for c in host)
+                        or any(c in host for c in "/\\@?#")
+                        or not authority.hostname or authority.port == 0):
+                    raise ValueError("Invalid Host header")
+            except ValueError:
+                self.respond(HTTPStatus.BAD_REQUEST)
+                return False
+            allowed = {host}
+        # Explicit loopback binding retains DNS-rebinding protection.
+        if host not in allowed:
             self.respond(HTTPStatus.FORBIDDEN)
             return False
         origin = self.headers.get("Origin")
-        if origin and origin not in {f"http://{host}" for host in allowed}:
+        origins = {f"{scheme}://{name}" for name in allowed for scheme in ("http", "https")}
+        if origin and origin not in origins:
             self.respond(HTTPStatus.FORBIDDEN)
             return False
         return True
 
     def do_GET(self):
-        if not self.local_request():
+        if not self.allowed_request():
             return
         if self.path == "/":
             self.respond(HTTPStatus.OK, self.server.page, "text/html; charset=utf-8")
@@ -140,13 +159,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind address (default: all IPv4 interfaces)")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--udp-host", default="127.0.0.1")
+    parser.add_argument("--udp-host", default="0.0.0.0", help="UDP bind address (default: all IPv4 interfaces)")
     parser.add_argument("--udp-port", type=int, default=8766)
     args = parser.parse_args()
-    with ViewerServer(("127.0.0.1", args.port)) as server, UdpReceiver(
+    with ViewerServer((args.host, args.port)) as server, UdpReceiver(
             server.store, args.udp_host, args.udp_port) as receiver:
-        print(f"Viewer: http://127.0.0.1:{server.server_port} | UDP: {receiver.address}", flush=True)
+        viewer_host = "SERVER_IP" if args.host == "0.0.0.0" else args.host
+        print(f"Viewer: http://{viewer_host}:{server.server_port}/ "
+              f"(HTTP bind {args.host}) | UDP: {receiver.address}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

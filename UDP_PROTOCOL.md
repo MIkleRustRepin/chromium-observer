@@ -1,7 +1,9 @@
 # COU1
 
 Native Chromium sends one JPEG per capture cycle as independent UDP datagrams.
-Default receiver: `udp://127.0.0.1:8766`. The HTTP viewer uses TCP port 8765.
+Default browser destination: `udp://127.0.0.1:8766`. The Python server CLI listens
+on all IPv4 interfaces by default: UDP port 8766 and HTTP viewer TCP port 8765.
+Use `--host 127.0.0.1 --udp-host 127.0.0.1` for loopback-only listening.
 Every datagram has a 68-byte header followed by up to 1132 JPEG bytes. Maximum
 UDP payload including the header is 1200 bytes. All integers are unsigned and
 encoded in network byte order. Python header format: `!4s36sQQIHHI`.
