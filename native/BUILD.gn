@@ -5,7 +5,7 @@
 assert(is_linux || is_mac)
 
 declare_args() {
-  page_frame_stream_endpoint = "http://127.0.0.1:8765/api/frame"
+  page_frame_stream_endpoint = "udp://127.0.0.1:8766"
 
   # GN has no floating-point values; pass the numeric scale as a string.
   page_frame_stream_scale = "1.0"
@@ -24,9 +24,9 @@ source_set("browser_tests") {
     "//components/tabs:public",
     "//content/test:test_support",
     "//net",
-    "//services/network:test_support",
     "//skia",
     "//testing/gtest",
+    "//third_party/zlib",
     "//ui/gfx/codec",
   ]
 }
@@ -35,6 +35,7 @@ source_set("observer") {
   sources = [
     "page_frame_streamer.cc",
     "page_frame_streamer.h",
+    "udp_frame_protocol.h",
   ]
   defines = [
     "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"",
@@ -47,15 +48,13 @@ source_set("observer") {
     "//url",
   ]
   deps = [
-    "//chrome/browser/net",
     "//chrome/browser/profiles:profile",
     "//chrome/browser/ui/browser_window",
     "//components/tabs:public",
     "//components/viz/common",
     "//net",
-    "//services/network/public/cpp",
-    "//services/network/public/mojom",
     "//skia",
+    "//third_party/zlib",
     "//ui/base",
     "//ui/gfx/codec",
   ]

@@ -4,15 +4,19 @@
 
 #include "chrome/browser/observer/page_frame_streamer.h"
 
+#include <fcntl.h>
+#include <sys/socket.h>
+
 #include <cstddef>
 #include <utility>
 
+#include "base/files/scoped_file.h"
 #include "base/functional/bind.h"
-#include "base/strings/string_number_conversions.h"
 #include "base/task/bind_post_task.h"
 #include "base/task/thread_pool.h"
+#include "base/threading/platform_thread.h"
 #include "base/uuid.h"
-#include "chrome/browser/net/system_network_context_manager.h"
+#include "chrome/browser/observer/udp_frame_protocol.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
@@ -20,15 +24,11 @@
 #include "components/viz/common/frame_sinks/copy_output_result.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/web_contents.h"
-#include "net/base/load_flags.h"
-#include "net/base/request_priority.h"
-#include "net/http/http_response_headers.h"
-#include "net/traffic_annotation/network_traffic_annotation.h"
-#include "services/network/public/cpp/resource_request.h"
-#include "services/network/public/cpp/shared_url_loader_factory.h"
-#include "services/network/public/cpp/simple_url_loader.h"
-#include "services/network/public/mojom/fetch_api.mojom.h"
+#include "net/base/ip_address.h"
+#include "net/base/ip_endpoint.h"
+#include "net/base/url_util.h"
 #include "third_party/skia/include/core/SkBitmap.h"
+#include "third_party/zlib/zlib.h"
 #include "ui/base/base_window.h"
 #include "ui/gfx/codec/jpeg_codec.h"
 #include "ui/gfx/geometry/rect.h"
@@ -40,7 +40,7 @@ namespace {
 
 constexpr base::TimeDelta kInterval = base::Seconds(1);
 constexpr base::TimeDelta kCopyTimeout = base::Milliseconds(500);
-constexpr base::TimeDelta kUploadTimeout = base::Seconds(2);
+constexpr base::TimeDelta kSendTimeout = base::Seconds(2);
 constexpr size_t kMaxJpegBytes = 32 * 1024 * 1024;
 constexpr double kFrameScale = PAGE_FRAME_STREAM_SCALE;
 static_assert(kFrameScale > 0 && kFrameScale <= 1);
@@ -68,33 +68,75 @@ std::optional<std::vector<uint8_t>> Encode(SkBitmap bitmap) {
   return gfx::JPEGCodec::Encode(bitmap, 80);
 }
 
-constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
-    net::DefineNetworkTrafficAnnotation("chromium_observer_page_frame", R"(
-      semantics {
-        sender: "Chromium Observer"
-        description:
-          "This dedicated Chromium fork sends a JPEG of the visible active "
-          "page to the owner's observation server."
-        trigger: "Once per second while an eligible browser window is visible."
-        data: "Rendered page pixels, capture time, session ID and frame number."
-        destination: OTHER
-        destination_other: "The observation endpoint configured at build time."
-      }
-      policy {
-        cookies_allowed: NO
-        setting: "Enabled automatically in this dedicated observation build."
-        policy_exception_justification:
-          "This is an owner-operated custom browser build for observing an AI agent."
-      }
-    )");
+std::optional<net::IPEndPoint> ParseEndpoint(std::string_view endpoint) {
+  if (!endpoint.starts_with("udp://")) {
+    return std::nullopt;
+  }
+  std::string host;
+  int port = -1;
+  net::IPAddress ip;
+  if (!net::ParseHostAndPort(endpoint.substr(6), &host, &port) || port < 1 ||
+      port > 65535 || !ip.AssignFromIPLiteral(host)) {
+    return std::nullopt;
+  }
+  return net::IPEndPoint(ip, static_cast<uint16_t>(port));
+}
+
+bool SendUdpFrame(const std::string& endpoint,
+                  const std::string& session,
+                  uint64_t sequence,
+                  base::Time captured_at,
+                  std::vector<uint8_t> jpeg,
+                  std::shared_ptr<std::atomic_bool> cancel) {
+  const auto address = ParseEndpoint(endpoint);
+  if (!address || cancel->load()) {
+    return false;
+  }
+  sockaddr_storage storage{};
+  auto* peer = reinterpret_cast<sockaddr*>(&storage);
+  socklen_t peer_size = sizeof(storage);
+  if (!address->ToSockAddr(peer, &peer_size)) {
+    return false;
+  }
+  base::ScopedFD socket_fd(socket(peer->sa_family, SOCK_DGRAM, 0));
+  if (!socket_fd.is_valid() ||
+      fcntl(socket_fd.get(), F_SETFD, FD_CLOEXEC) < 0 ||
+      fcntl(socket_fd.get(), F_SETFL, O_NONBLOCK) < 0 ||
+      connect(socket_fd.get(), peer, peer_size) < 0) {
+    return false;
+  }
+  const auto deadline = base::TimeTicks::Now() + kSendTimeout;
+  const auto checksum = static_cast<uint32_t>(
+      crc32(0, jpeg.data(), static_cast<uInt>(jpeg.size())));
+  const uint64_t captured_ms =
+      (captured_at - base::Time::UnixEpoch()).InMilliseconds();
+  const size_t count =
+      (jpeg.size() + udp::kPayloadBytes - 1) / udp::kPayloadBytes;
+  for (size_t index = 0; index < count; ++index) {
+    if (cancel->load() || base::TimeTicks::Now() >= deadline) {
+      return false;
+    }
+    const auto packet = udp::MakeDatagram(session, sequence, captured_ms, jpeg,
+                                          index, checksum);
+    if (send(socket_fd.get(), packet.data(), packet.size(), 0) !=
+        static_cast<ssize_t>(packet.size())) {
+      return false;
+    }
+    // Pace at most four packets per millisecond to avoid a single UDP burst.
+    if (index % 4 == 3) {
+      base::PlatformThread::Sleep(base::Milliseconds(1));
+    }
+  }
+  return true;
+}
 
 }  // namespace
 
 PageFrameStreamer::PageFrameStreamer()
-    : PageFrameStreamer(GURL(PAGE_FRAME_STREAM_ENDPOINT)) {}
+    : PageFrameStreamer(std::string(PAGE_FRAME_STREAM_ENDPOINT)) {}
 
-PageFrameStreamer::PageFrameStreamer(const GURL& endpoint)
-    : endpoint_(endpoint),
+PageFrameStreamer::PageFrameStreamer(std::string endpoint)
+    : endpoint_(std::move(endpoint)),
       session_(base::Uuid::GenerateRandomV4().AsLowercaseString()) {}
 
 PageFrameStreamer::~PageFrameStreamer() {
@@ -102,12 +144,9 @@ PageFrameStreamer::~PageFrameStreamer() {
 }
 
 void PageFrameStreamer::PostBrowserStart() {
-  if (timer_.IsRunning() || !endpoint_.SchemeIsHTTPOrHTTPS()) {
+  if (timer_.IsRunning() || !ParseEndpoint(endpoint_)) {
     return;
   }
-  // The system context is separate from profiles and page storage partitions.
-  factory_ =
-      SystemNetworkContextManager::GetInstance()->GetSharedURLLoaderFactory();
   timer_.Start(FROM_HERE, kInterval, this, &PageFrameStreamer::Tick);
 }
 
@@ -116,22 +155,24 @@ void PageFrameStreamer::PostMainMessageLoopRun() {
   weak_factory_.InvalidateWeakPtrs();
   FinishCycle();
   Observe(nullptr);
-  factory_.reset();
 }
 
 void PageFrameStreamer::FinishCycle() {
   active_cycle_ = 0;
   invalidated_ = false;
-  upload_.reset();
+  if (send_cancel_) {
+    send_cancel_->store(true);
+    send_cancel_.reset();
+  }
 }
 
 void PageFrameStreamer::InvalidateCycle() {
-  if (upload_) {
-    FinishCycle();
-  } else if (active_cycle_ != 0) {
-    // Copy/encoding work cannot be cancelled. Keep the slot occupied until
-    // its callback returns, so repeated navigations cannot queue bitmaps.
+  if (active_cycle_ != 0) {
+    // Keep the slot occupied until copy/encoding/sending has replied.
     invalidated_ = true;
+    if (send_cancel_) {
+      send_cancel_->store(true);
+    }
   }
 }
 
@@ -201,34 +242,16 @@ void PageFrameStreamer::OnEncoded(uint64_t cycle,
     FinishCycle();
     return;
   }
-  auto request = std::make_unique<network::ResourceRequest>();
-  request->url = endpoint_;
-  request->method = "POST";
-  request->priority = net::IDLE;
-  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
-  request->redirect_mode = network::mojom::RedirectMode::kError;
-  request->load_flags = net::LOAD_DISABLE_CACHE | net::LOAD_BYPASS_CACHE;
-  request->do_not_prompt_for_login = true;
-  request->headers.SetHeader("X-Frame-Session", session_);
-  request->headers.SetHeader("X-Frame-Sequence", base::NumberToString(cycle));
-  request->headers.SetHeader(
-      "X-Captured-At",
-      base::NumberToString(
-          (captured_at - base::Time::UnixEpoch()).InMilliseconds()));
-  upload_ =
-      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
-  upload_->SetTimeoutDuration(kUploadTimeout);
-  upload_->AttachStringForUpload(
-      std::string(reinterpret_cast<const char*>(jpeg->data()), jpeg->size()),
-      "image/jpeg");
-  upload_->DownloadHeadersOnly(
-      factory_.get(), base::BindOnce(&PageFrameStreamer::OnUploaded,
-                                     weak_factory_.GetWeakPtr(), cycle));
+  send_cancel_ = std::make_shared<std::atomic_bool>(false);
+  base::ThreadPool::PostTaskAndReplyWithResult(
+      FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
+      base::BindOnce(&SendUdpFrame, endpoint_, session_, cycle, captured_at,
+                     std::move(*jpeg), send_cancel_),
+      base::BindOnce(&PageFrameStreamer::OnSent, weak_factory_.GetWeakPtr(),
+                     cycle));
 }
 
-void PageFrameStreamer::OnUploaded(
-    uint64_t cycle,
-    scoped_refptr<net::HttpResponseHeaders> headers) {
+void PageFrameStreamer::OnSent(uint64_t cycle, bool sent) {
   if (active_cycle_ == cycle) {
     FinishCycle();
   }

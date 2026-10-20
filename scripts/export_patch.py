@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "chromium/src"
 files = [
     "chrome/browser/observer/BUILD.gn",
+    "chrome/browser/observer/udp_frame_protocol.h",
     "chrome/browser/observer/page_frame_streamer.h",
     "chrome/browser/observer/page_frame_streamer.cc",
     "chrome/browser/observer/page_frame_streamer_browsertest.cc",

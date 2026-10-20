@@ -110,7 +110,7 @@ const matches = (actual, expected) => actual.every((value, i) => Math.abs(value 
   await cdp.send('Browser.setWindowBounds', {windowId, bounds: {windowState: 'normal'}});
   await page.bringToFront();
   current = await waitFrame(f => f.sequence > minimized.sequence && matches(f.color, [160,20,200]));
-  // The producer must reconnect after a receiver restart, without user action.
+  // The producer must deliver again after a receiver restart, without user action.
   server.kill('SIGTERM');
   await new Promise(resolve => server.once('exit', resolve));
   await sleep(250);

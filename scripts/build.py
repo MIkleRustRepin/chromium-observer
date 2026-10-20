@@ -2,6 +2,7 @@
 """Build this fork natively, stopping if disk reserve falls below 5 GiB."""
 import argparse
 import json
+import ipaddress
 import math
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "chromium" / "src"
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--jobs", type=int, default=2)
-parser.add_argument("--endpoint", default="http://127.0.0.1:8765/api/frame")
+parser.add_argument("--endpoint", default="udp://127.0.0.1:8766")
 parser.add_argument("--scale", type=float, default=1.0,
                     help="Frame width/height relative to rendered pixels, 0 < scale <= 1 (default: 1.0)")
 parser.add_argument("--tests", action="store_true", help="Also build browser_tests")
@@ -28,9 +29,15 @@ parser.add_argument("--generate-only", action="store_true", help="Validate/gener
 args = parser.parse_args()
 if not math.isfinite(args.scale) or not 0 < args.scale <= 1:
     parser.error("--scale must be greater than 0 and at most 1")
-endpoint = urlparse(args.endpoint)
-if endpoint.scheme not in ("http", "https") or not endpoint.hostname or any(c in args.endpoint for c in '\\"\n\r'):
-    sys.exit("Endpoint must be an HTTP(S) URL without quotes or escapes.")
+try:
+    endpoint = urlparse(args.endpoint)
+    ipaddress.ip_address(endpoint.hostname)
+    if (endpoint.scheme != "udp" or not endpoint.port or endpoint.path or endpoint.query
+            or endpoint.fragment or endpoint.username is not None or endpoint.password is not None
+            or "%" in endpoint.hostname):
+        raise ValueError("Invalid UDP endpoint")
+except (TypeError, ValueError):
+    sys.exit("Endpoint must be udp://IP:PORT, for example udp://127.0.0.1:8766 or udp://[::1]:8766.")
 if args.jobs < 1:
     sys.exit("--jobs must be positive")
 if sys.platform not in ("linux", "darwin"):

@@ -14,7 +14,7 @@ fresh checkout (150+ recommended). No Homebrew or globally installed Python
 packages are required. Downloads and compilation resume on the next run.
 
   --jobs N       Parallel compile jobs (default chosen from RAM and CPU count)
-  --endpoint URL Frame receiver (default http://127.0.0.1:8765/api/frame)
+  --endpoint URL UDP frame receiver, udp://IP:PORT (default udp://127.0.0.1:8766)
   --scale FACTOR Frame width/height scale, 0 < scale <= 1 (default: 0.75)
   --tests        Also build browser_tests; does not run the tests
   --clean        Clear only out/Observer build artifacts before compiling
@@ -28,7 +28,7 @@ EOF
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 jobs=''
-endpoint='http://127.0.0.1:8765/api/frame'
+endpoint='udp://127.0.0.1:8766'
 scale='0.75'
 tests=0
 clean=0
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || fail '--jobs needs a positive integer'
       jobs="$2"; shift 2 ;;
     --endpoint)
-      [[ $# -ge 2 ]] || fail '--endpoint needs an HTTP(S) URL'
+      [[ $# -ge 2 ]] || fail '--endpoint needs udp://IP:PORT'
       endpoint="$2"; shift 2 ;;
     --scale)
       [[ $# -ge 2 ]] || fail '--scale needs a number greater than 0 and at most 1'
@@ -74,6 +74,7 @@ command -v git >/dev/null || fail 'Git is missing; install the Xcode command-lin
 command -v python3 >/dev/null || fail 'Python 3 from Xcode command-line tools is missing.'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' || fail 'Bootstrap needs Python 3.9+ from Xcode command-line tools.'
 python3 -c 'import math,sys; value=float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and 0 < value <= 1 else 1)' "$scale" || fail '--scale must be a number greater than 0 and at most 1'
+python3 -c 'import ipaddress,sys; from urllib.parse import urlparse; e=urlparse(sys.argv[1]); ipaddress.ip_address(e.hostname); assert e.scheme=="udp" and e.port and not (e.path or e.query or e.fragment or "%" in e.hostname) and e.username is None and e.password is None' "$endpoint" || fail '--endpoint must be udp://IP:PORT'
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 if [[ ! -f "$root/upstream.json" || ! -f "$root/scripts/bootstrap.py" ]]; then

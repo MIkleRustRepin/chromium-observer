@@ -10,11 +10,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-import re
 import threading
 import time
 
-MAX_FRAME_BYTES = 32 * 1024 * 1024
+from .udp_transport import MAX_FRAME_BYTES, UdpReceiver
 
 
 @dataclass(frozen=True)
@@ -41,6 +40,8 @@ class FrameStore:
                 if previous.session == session and sequence <= previous.sequence:
                     return False
                 if previous.session != session:
+                    if captured_at_ms < previous.captured_at_ms:
+                        return False
                     self.retired_sessions.append(previous.session)
             self.latest = Frame(jpeg, session, sequence, captured_at_ms,
                                 time.time_ns() // 1_000_000)
@@ -134,51 +135,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.close_connection = True
-        if not self.local_request():
-            return
-        if self.path != "/api/frame":
-            self.respond(HTTPStatus.NOT_FOUND)
-            return
-        if self.headers.get("Content-Type") != "image/jpeg":
-            self.respond(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-            return
-        try:
-            if self.headers.get("Transfer-Encoding"):
-                raise ValueError("chunked upload is unsupported")
-            length = int(self.headers["Content-Length"])
-            session = self.headers["X-Frame-Session"]
-            sequence = int(self.headers["X-Frame-Sequence"])
-            captured = int(self.headers["X-Captured-At"])
-            if not re.fullmatch(r"[a-zA-Z0-9-]{1,64}", session or ""):
-                raise ValueError("invalid session")
-            if sequence < 1 or captured < 1 or length < 4:
-                raise ValueError("invalid metadata")
-        except (TypeError, ValueError):
-            self.respond(HTTPStatus.BAD_REQUEST)
-            return
-        if length > MAX_FRAME_BYTES:
-            self.respond(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-            return
-        try:
-            jpeg = self.rfile.read(length)
-        except TimeoutError:
-            self.respond(HTTPStatus.REQUEST_TIMEOUT)
-            return
-        if len(jpeg) != length or not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
-            self.respond(HTTPStatus.BAD_REQUEST)
-            return
-        if not self.server.store.put(jpeg, session, sequence, captured):
-            self.respond(HTTPStatus.CONFLICT)
-            return
-        self.respond(HTTPStatus.NO_CONTENT)
+        self.respond(HTTPStatus.METHOD_NOT_ALLOWED)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--udp-host", default="127.0.0.1")
+    parser.add_argument("--udp-port", type=int, default=8766)
     args = parser.parse_args()
-    with ViewerServer(("127.0.0.1", args.port)) as server:
-        print(f"Viewer: http://127.0.0.1:{server.server_port}", flush=True)
+    with ViewerServer(("127.0.0.1", args.port)) as server, UdpReceiver(
+            server.store, args.udp_host, args.udp_port) as receiver:
+        print(f"Viewer: http://127.0.0.1:{server.server_port} | UDP: {receiver.address}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

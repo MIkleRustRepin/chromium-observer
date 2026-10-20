@@ -41,10 +41,10 @@ index cbf3b6c563..c31eb633e8 100644
    main_parts->AddParts(std::make_unique<ChromeBrowserMainExtraPartsGpu>());
 diff --git a/chrome/browser/observer/BUILD.gn b/chrome/browser/observer/BUILD.gn
 new file mode 100644
-index 0000000000..551507d897
+index 0000000000..a373d13649
 --- /dev/null
 +++ b/chrome/browser/observer/BUILD.gn
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,61 @@
 +# Copyright 2026 Chromium Observer Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the Chromium LICENSE file.
@@ -52,7 +52,7 @@ index 0000000000..551507d897
 +assert(is_linux || is_mac)
 +
 +declare_args() {
-+  page_frame_stream_endpoint = "http://127.0.0.1:8765/api/frame"
++  page_frame_stream_endpoint = "udp://127.0.0.1:8766"
 +
 +  # GN has no floating-point values; pass the numeric scale as a string.
 +  page_frame_stream_scale = "1.0"
@@ -71,9 +71,9 @@ index 0000000000..551507d897
 +    "//components/tabs:public",
 +    "//content/test:test_support",
 +    "//net",
-+    "//services/network:test_support",
 +    "//skia",
 +    "//testing/gtest",
++    "//third_party/zlib",
 +    "//ui/gfx/codec",
 +  ]
 +}
@@ -82,6 +82,7 @@ index 0000000000..551507d897
 +  sources = [
 +    "page_frame_streamer.cc",
 +    "page_frame_streamer.h",
++    "udp_frame_protocol.h",
 +  ]
 +  defines = [
 +    "PAGE_FRAME_STREAM_ENDPOINT=\"$page_frame_stream_endpoint\"",
@@ -94,40 +95,42 @@ index 0000000000..551507d897
 +    "//url",
 +  ]
 +  deps = [
-+    "//chrome/browser/net",
 +    "//chrome/browser/profiles:profile",
 +    "//chrome/browser/ui/browser_window",
 +    "//components/tabs:public",
 +    "//components/viz/common",
 +    "//net",
-+    "//services/network/public/cpp",
-+    "//services/network/public/mojom",
 +    "//skia",
++    "//third_party/zlib",
 +    "//ui/base",
 +    "//ui/gfx/codec",
 +  ]
 +}
 diff --git a/chrome/browser/observer/page_frame_streamer.cc b/chrome/browser/observer/page_frame_streamer.cc
 new file mode 100644
-index 0000000000..08a78b11dd
+index 0000000000..60bceb5c23
 --- /dev/null
 +++ b/chrome/browser/observer/page_frame_streamer.cc
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,272 @@
 +// Copyright 2026 Chromium Observer Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the Chromium LICENSE file.
 +
 +#include "chrome/browser/observer/page_frame_streamer.h"
 +
++#include <fcntl.h>
++#include <sys/socket.h>
++
 +#include <cstddef>
 +#include <utility>
 +
++#include "base/files/scoped_file.h"
 +#include "base/functional/bind.h"
-+#include "base/strings/string_number_conversions.h"
 +#include "base/task/bind_post_task.h"
 +#include "base/task/thread_pool.h"
++#include "base/threading/platform_thread.h"
 +#include "base/uuid.h"
-+#include "chrome/browser/net/system_network_context_manager.h"
++#include "chrome/browser/observer/udp_frame_protocol.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
@@ -135,15 +138,11 @@ index 0000000000..08a78b11dd
 +#include "components/viz/common/frame_sinks/copy_output_result.h"
 +#include "content/public/browser/navigation_handle.h"
 +#include "content/public/browser/web_contents.h"
-+#include "net/base/load_flags.h"
-+#include "net/base/request_priority.h"
-+#include "net/http/http_response_headers.h"
-+#include "net/traffic_annotation/network_traffic_annotation.h"
-+#include "services/network/public/cpp/resource_request.h"
-+#include "services/network/public/cpp/shared_url_loader_factory.h"
-+#include "services/network/public/cpp/simple_url_loader.h"
-+#include "services/network/public/mojom/fetch_api.mojom.h"
++#include "net/base/ip_address.h"
++#include "net/base/ip_endpoint.h"
++#include "net/base/url_util.h"
 +#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/zlib/zlib.h"
 +#include "ui/base/base_window.h"
 +#include "ui/gfx/codec/jpeg_codec.h"
 +#include "ui/gfx/geometry/rect.h"
@@ -155,7 +154,7 @@ index 0000000000..08a78b11dd
 +
 +constexpr base::TimeDelta kInterval = base::Seconds(1);
 +constexpr base::TimeDelta kCopyTimeout = base::Milliseconds(500);
-+constexpr base::TimeDelta kUploadTimeout = base::Seconds(2);
++constexpr base::TimeDelta kSendTimeout = base::Seconds(2);
 +constexpr size_t kMaxJpegBytes = 32 * 1024 * 1024;
 +constexpr double kFrameScale = PAGE_FRAME_STREAM_SCALE;
 +static_assert(kFrameScale > 0 && kFrameScale <= 1);
@@ -183,33 +182,75 @@ index 0000000000..08a78b11dd
 +  return gfx::JPEGCodec::Encode(bitmap, 80);
 +}
 +
-+constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
-+    net::DefineNetworkTrafficAnnotation("chromium_observer_page_frame", R"(
-+      semantics {
-+        sender: "Chromium Observer"
-+        description:
-+          "This dedicated Chromium fork sends a JPEG of the visible active "
-+          "page to the owner's observation server."
-+        trigger: "Once per second while an eligible browser window is visible."
-+        data: "Rendered page pixels, capture time, session ID and frame number."
-+        destination: OTHER
-+        destination_other: "The observation endpoint configured at build time."
-+      }
-+      policy {
-+        cookies_allowed: NO
-+        setting: "Enabled automatically in this dedicated observation build."
-+        policy_exception_justification:
-+          "This is an owner-operated custom browser build for observing an AI agent."
-+      }
-+    )");
++std::optional<net::IPEndPoint> ParseEndpoint(std::string_view endpoint) {
++  if (!endpoint.starts_with("udp://")) {
++    return std::nullopt;
++  }
++  std::string host;
++  int port = -1;
++  net::IPAddress ip;
++  if (!net::ParseHostAndPort(endpoint.substr(6), &host, &port) || port < 1 ||
++      port > 65535 || !ip.AssignFromIPLiteral(host)) {
++    return std::nullopt;
++  }
++  return net::IPEndPoint(ip, static_cast<uint16_t>(port));
++}
++
++bool SendUdpFrame(const std::string& endpoint,
++                  const std::string& session,
++                  uint64_t sequence,
++                  base::Time captured_at,
++                  std::vector<uint8_t> jpeg,
++                  std::shared_ptr<std::atomic_bool> cancel) {
++  const auto address = ParseEndpoint(endpoint);
++  if (!address || cancel->load()) {
++    return false;
++  }
++  sockaddr_storage storage{};
++  auto* peer = reinterpret_cast<sockaddr*>(&storage);
++  socklen_t peer_size = sizeof(storage);
++  if (!address->ToSockAddr(peer, &peer_size)) {
++    return false;
++  }
++  base::ScopedFD socket_fd(socket(peer->sa_family, SOCK_DGRAM, 0));
++  if (!socket_fd.is_valid() ||
++      fcntl(socket_fd.get(), F_SETFD, FD_CLOEXEC) < 0 ||
++      fcntl(socket_fd.get(), F_SETFL, O_NONBLOCK) < 0 ||
++      connect(socket_fd.get(), peer, peer_size) < 0) {
++    return false;
++  }
++  const auto deadline = base::TimeTicks::Now() + kSendTimeout;
++  const auto checksum = static_cast<uint32_t>(
++      crc32(0, jpeg.data(), static_cast<uInt>(jpeg.size())));
++  const uint64_t captured_ms =
++      (captured_at - base::Time::UnixEpoch()).InMilliseconds();
++  const size_t count =
++      (jpeg.size() + udp::kPayloadBytes - 1) / udp::kPayloadBytes;
++  for (size_t index = 0; index < count; ++index) {
++    if (cancel->load() || base::TimeTicks::Now() >= deadline) {
++      return false;
++    }
++    const auto packet = udp::MakeDatagram(session, sequence, captured_ms, jpeg,
++                                          index, checksum);
++    if (send(socket_fd.get(), packet.data(), packet.size(), 0) !=
++        static_cast<ssize_t>(packet.size())) {
++      return false;
++    }
++    // Pace at most four packets per millisecond to avoid a single UDP burst.
++    if (index % 4 == 3) {
++      base::PlatformThread::Sleep(base::Milliseconds(1));
++    }
++  }
++  return true;
++}
 +
 +}  // namespace
 +
 +PageFrameStreamer::PageFrameStreamer()
-+    : PageFrameStreamer(GURL(PAGE_FRAME_STREAM_ENDPOINT)) {}
++    : PageFrameStreamer(std::string(PAGE_FRAME_STREAM_ENDPOINT)) {}
 +
-+PageFrameStreamer::PageFrameStreamer(const GURL& endpoint)
-+    : endpoint_(endpoint),
++PageFrameStreamer::PageFrameStreamer(std::string endpoint)
++    : endpoint_(std::move(endpoint)),
 +      session_(base::Uuid::GenerateRandomV4().AsLowercaseString()) {}
 +
 +PageFrameStreamer::~PageFrameStreamer() {
@@ -217,12 +258,9 @@ index 0000000000..08a78b11dd
 +}
 +
 +void PageFrameStreamer::PostBrowserStart() {
-+  if (timer_.IsRunning() || !endpoint_.SchemeIsHTTPOrHTTPS()) {
++  if (timer_.IsRunning() || !ParseEndpoint(endpoint_)) {
 +    return;
 +  }
-+  // The system context is separate from profiles and page storage partitions.
-+  factory_ =
-+      SystemNetworkContextManager::GetInstance()->GetSharedURLLoaderFactory();
 +  timer_.Start(FROM_HERE, kInterval, this, &PageFrameStreamer::Tick);
 +}
 +
@@ -231,22 +269,24 @@ index 0000000000..08a78b11dd
 +  weak_factory_.InvalidateWeakPtrs();
 +  FinishCycle();
 +  Observe(nullptr);
-+  factory_.reset();
 +}
 +
 +void PageFrameStreamer::FinishCycle() {
 +  active_cycle_ = 0;
 +  invalidated_ = false;
-+  upload_.reset();
++  if (send_cancel_) {
++    send_cancel_->store(true);
++    send_cancel_.reset();
++  }
 +}
 +
 +void PageFrameStreamer::InvalidateCycle() {
-+  if (upload_) {
-+    FinishCycle();
-+  } else if (active_cycle_ != 0) {
-+    // Copy/encoding work cannot be cancelled. Keep the slot occupied until
-+    // its callback returns, so repeated navigations cannot queue bitmaps.
++  if (active_cycle_ != 0) {
++    // Keep the slot occupied until copy/encoding/sending has replied.
 +    invalidated_ = true;
++    if (send_cancel_) {
++      send_cancel_->store(true);
++    }
 +  }
 +}
 +
@@ -316,34 +356,16 @@ index 0000000000..08a78b11dd
 +    FinishCycle();
 +    return;
 +  }
-+  auto request = std::make_unique<network::ResourceRequest>();
-+  request->url = endpoint_;
-+  request->method = "POST";
-+  request->priority = net::IDLE;
-+  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
-+  request->redirect_mode = network::mojom::RedirectMode::kError;
-+  request->load_flags = net::LOAD_DISABLE_CACHE | net::LOAD_BYPASS_CACHE;
-+  request->do_not_prompt_for_login = true;
-+  request->headers.SetHeader("X-Frame-Session", session_);
-+  request->headers.SetHeader("X-Frame-Sequence", base::NumberToString(cycle));
-+  request->headers.SetHeader(
-+      "X-Captured-At",
-+      base::NumberToString(
-+          (captured_at - base::Time::UnixEpoch()).InMilliseconds()));
-+  upload_ =
-+      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
-+  upload_->SetTimeoutDuration(kUploadTimeout);
-+  upload_->AttachStringForUpload(
-+      std::string(reinterpret_cast<const char*>(jpeg->data()), jpeg->size()),
-+      "image/jpeg");
-+  upload_->DownloadHeadersOnly(
-+      factory_.get(), base::BindOnce(&PageFrameStreamer::OnUploaded,
-+                                     weak_factory_.GetWeakPtr(), cycle));
++  send_cancel_ = std::make_shared<std::atomic_bool>(false);
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++      base::BindOnce(&SendUdpFrame, endpoint_, session_, cycle, captured_at,
++                     std::move(*jpeg), send_cancel_),
++      base::BindOnce(&PageFrameStreamer::OnSent, weak_factory_.GetWeakPtr(),
++                     cycle));
 +}
 +
-+void PageFrameStreamer::OnUploaded(
-+    uint64_t cycle,
-+    scoped_refptr<net::HttpResponseHeaders> headers) {
++void PageFrameStreamer::OnSent(uint64_t cycle, bool sent) {
 +  if (active_cycle_ == cycle) {
 +    FinishCycle();
 +  }
@@ -364,10 +386,10 @@ index 0000000000..08a78b11dd
 +}  // namespace observer
 diff --git a/chrome/browser/observer/page_frame_streamer.h b/chrome/browser/observer/page_frame_streamer.h
 new file mode 100644
-index 0000000000..447c61b69c
+index 0000000000..06273fe166
 --- /dev/null
 +++ b/chrome/browser/observer/page_frame_streamer.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,66 @@
 +// Copyright 2026 Chromium Observer Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the Chromium LICENSE file.
@@ -375,6 +397,7 @@ index 0000000000..447c61b69c
 +#ifndef CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
 +#define CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
 +
++#include <atomic>
 +#include <cstdint>
 +#include <memory>
 +#include <optional>
@@ -388,15 +411,6 @@ index 0000000000..447c61b69c
 +#include "chrome/browser/chrome_browser_main_extra_parts.h"
 +#include "content/public/browser/render_widget_host_view.h"
 +#include "content/public/browser/web_contents_observer.h"
-+#include "url/gurl.h"
-+
-+namespace net {
-+class HttpResponseHeaders;
-+}
-+namespace network {
-+class SharedURLLoaderFactory;
-+class SimpleURLLoader;
-+}  // namespace network
 +
 +namespace observer {
 +
@@ -405,7 +419,7 @@ index 0000000000..447c61b69c
 +                          public content::WebContentsObserver {
 + public:
 +  PageFrameStreamer();
-+  explicit PageFrameStreamer(const GURL& endpoint);
++  explicit PageFrameStreamer(std::string endpoint);
 +  ~PageFrameStreamer() override;
 +
 +  void PostBrowserStart() override;
@@ -424,20 +438,18 @@ index 0000000000..447c61b69c
 +  void OnEncoded(uint64_t cycle,
 +                 base::Time captured_at,
 +                 std::optional<std::vector<uint8_t>> jpeg);
-+  void OnUploaded(uint64_t cycle,
-+                  scoped_refptr<net::HttpResponseHeaders> headers);
++  void OnSent(uint64_t cycle, bool sent);
 +
 +  void DidStartNavigation(content::NavigationHandle* navigation) override;
 +  void WebContentsDestroyed() override;
 +
-+  const GURL endpoint_;
++  const std::string endpoint_;
 +  const std::string session_;
 +  uint64_t next_cycle_ = 0;
 +  uint64_t active_cycle_ = 0;
 +  bool invalidated_ = false;
 +  base::RepeatingTimer timer_;
-+  scoped_refptr<network::SharedURLLoaderFactory> factory_;
-+  std::unique_ptr<network::SimpleURLLoader> upload_;
++  std::shared_ptr<std::atomic_bool> send_cancel_;
 +  base::WeakPtrFactory<PageFrameStreamer> weak_factory_{this};
 +};
 +
@@ -446,22 +458,31 @@ index 0000000000..447c61b69c
 +#endif  // CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
 diff --git a/chrome/browser/observer/page_frame_streamer_browsertest.cc b/chrome/browser/observer/page_frame_streamer_browsertest.cc
 new file mode 100644
-index 0000000000..d36e18b9e8
+index 0000000000..47acadf5e1
 --- /dev/null
 +++ b/chrome/browser/observer/page_frame_streamer_browsertest.cc
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,198 @@
 +// Copyright 2026 Chromium Observer Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the Chromium LICENSE file.
 +
 +#include "chrome/browser/observer/page_frame_streamer.h"
 +
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++#include <array>
++#include <map>
++
 +#include "base/containers/span.h"
-+#include "base/functional/bind.h"
++#include "base/files/scoped_file.h"
 +#include "base/memory/raw_ptr.h"
 +#include "base/run_loop.h"
++#include "base/strings/string_number_conversions.h"
 +#include "base/test/run_until.h"
 +#include "base/test/scoped_run_loop_timeout.h"
++#include "chrome/browser/observer/udp_frame_protocol.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/test/base/in_process_browser_test.h"
@@ -470,22 +491,32 @@ index 0000000000..d36e18b9e8
 +#include "content/public/browser/web_contents.h"
 +#include "content/public/test/browser_test.h"
 +#include "content/public/test/browser_test_utils.h"
-+#include "net/http/http_status_code.h"
-+#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
-+#include "services/network/test/test_url_loader_factory.h"
-+#include "services/network/test/test_utils.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +#include "third_party/skia/include/core/SkBitmap.h"
 +#include "third_party/skia/include/core/SkColor.h"
 +#include "ui/gfx/codec/jpeg_codec.h"
 +#include "ui/gfx/geometry/size.h"
 +#include "ui/gfx/geometry/size_conversions.h"
++#include "url/gurl.h"
 +
 +namespace observer {
 +
 +class PageFrameStreamerBrowserTest : public InProcessBrowserTest {
 + protected:
 +  void SetUpOnMainThread() override {
++    receiver_.reset(socket(AF_INET, SOCK_DGRAM, 0));
++    ASSERT_TRUE(receiver_.is_valid());
++    sockaddr_in address{};
++    address.sin_family = AF_INET;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    ASSERT_EQ(0, bind(receiver_.get(), reinterpret_cast<sockaddr*>(&address),
++                      sizeof(address)));
++    socklen_t length = sizeof(address);
++    ASSERT_EQ(0, getsockname(receiver_.get(),
++                             reinterpret_cast<sockaddr*>(&address), &length));
++    ASSERT_EQ(0, fcntl(receiver_.get(), F_SETFL, O_NONBLOCK));
++    endpoint_ =
++        "udp://127.0.0.1:" + base::NumberToString(ntohs(address.sin_port));
 +    ASSERT_TRUE(ui_test_utils::NavigateToURL(
 +        browser(), GURL("data:text/html,<body "
 +                        "style='margin:0;background:rgb(20,80,200)'>")));
@@ -493,24 +524,47 @@ index 0000000000..d36e18b9e8
 +    content::WaitForCopyableViewInWebContents(contents_);
 +    streamer_ = std::make_unique<PageFrameStreamer>(endpoint_);
 +    streamer_->PostBrowserStart();
-+    // Tests advance individual ticks without depending on wall-clock timing.
 +    streamer_->timer_.Stop();
-+    streamer_->factory_ = factory_.GetSafeWeakWrapper();
-+    factory_.SetInterceptor(base::BindRepeating(
-+        [](int* count, const network::ResourceRequest&) { ++*count; },
-+        &requests_));
 +  }
 +
 +  void TearDownOnMainThread() override {
 +    streamer_.reset();
 +    contents_ = nullptr;
++    receiver_.reset();
 +  }
 +
 +  void Tick() { streamer_->Tick(); }
 +  bool Idle() const { return streamer_->active_cycle_ == 0; }
-+  void WaitForRequests(int count) {
++  void WaitIdle() {
++    ASSERT_TRUE(base::test::RunUntil([&] { return Idle(); }));
++  }
++  bool ReceiveFrame() {
++    std::array<uint8_t, udp::kDatagramBytes> packet;
++    for (;;) {
++      const ssize_t length =
++          recv(receiver_.get(), packet.data(), packet.size(), 0);
++      if (length <= static_cast<ssize_t>(udp::kHeaderBytes)) {
++        return false;
++      }
++      const size_t index = (static_cast<size_t>(packet[60]) << 8) | packet[61];
++      const size_t count = (static_cast<size_t>(packet[62]) << 8) | packet[63];
++      chunks_[index] = std::vector<uint8_t>(packet.begin() + udp::kHeaderBytes,
++                                            packet.begin() + length);
++      if (chunks_.size() != count) {
++        continue;
++      }
++      jpeg_.clear();
++      for (size_t n = 0; n < count; ++n) {
++        const auto& chunk = chunks_.at(n);
++        jpeg_.insert(jpeg_.end(), chunk.begin(), chunk.end());
++      }
++      chunks_.clear();
++      return true;
++    }
++  }
++  void WaitForFrame() {
 +    base::test::ScopedRunLoopTimeout timeout(FROM_HERE, base::Seconds(15));
-+    ASSERT_TRUE(base::test::RunUntil([&] { return requests_ >= count; }));
++    ASSERT_TRUE(base::test::RunUntil([&] { return ReceiveFrame(); }));
 +  }
 +  uint64_t BeginSyntheticCapture(content::WebContents* contents) {
 +    streamer_->Observe(contents);
@@ -522,29 +576,27 @@ index 0000000000..d36e18b9e8
 +    streamer_->OnEncoded(cycle, base::Time::Now(),
 +                         std::vector<uint8_t>{0xff, 0xd8, 0xff, 0xd9});
 +  }
++  void ExpectCancelledOnShutdown() {
++    auto cancel = std::make_shared<std::atomic_bool>(false);
++    streamer_->send_cancel_ = cancel;
++    streamer_->PostMainMessageLoopRun();
++    EXPECT_TRUE(cancel->load());
++    EXPECT_TRUE(Idle());
++  }
 +
-+  const GURL endpoint_{"http://127.0.0.1:18766/api/frame"};
-+  network::TestURLLoaderFactory factory_;
-+  int requests_ = 0;
++  base::ScopedFD receiver_;
++  std::string endpoint_;
 +  raw_ptr<content::WebContents> contents_ = nullptr;
 +  std::unique_ptr<PageFrameStreamer> streamer_;
++  std::map<size_t, std::vector<uint8_t>> chunks_;
++  std::vector<uint8_t> jpeg_;
 +};
 +
 +IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
-+                       CapturesPagePixelsWithoutCredentials) {
++                       CapturesPagePixelsOverUdp) {
 +  Tick();
-+  WaitForRequests(1);
-+  auto* pending = factory_.GetPendingRequest(0);
-+  ASSERT_TRUE(pending);
-+  const auto& request = pending->request;
-+  EXPECT_EQ("POST", request.method);
-+  EXPECT_EQ(network::mojom::CredentialsMode::kOmit, request.credentials_mode);
-+  EXPECT_EQ(network::mojom::RedirectMode::kError, request.redirect_mode);
-+  EXPECT_TRUE(request.headers.HasHeader("X-Frame-Session"));
-+  EXPECT_TRUE(request.headers.HasHeader("X-Frame-Sequence"));
-+  EXPECT_TRUE(request.headers.HasHeader("X-Captured-At"));
-+  const std::string bytes = network::GetUploadData(request);
-+  SkBitmap bitmap = gfx::JPEGCodec::Decode(base::as_byte_span(bytes));
++  WaitForFrame();
++  SkBitmap bitmap = gfx::JPEGCodec::Decode(jpeg_);
 +  ASSERT_FALSE(bitmap.drawsNothing());
 +  auto size = gfx::ScaleToRoundedSize(
 +      contents_->GetRenderWidgetHostView()->GetVisibleViewportSizeDevicePx(),
@@ -560,19 +612,15 @@ index 0000000000..d36e18b9e8
 +}
 +
 +IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
-+                       SlowUploadSkipsTicksAndErrorAllowsRecovery) {
++                       BusyCycleSkipsTicksAndRecovers) {
++  BeginSyntheticCapture(contents_);
 +  Tick();
-+  WaitForRequests(1);
++  EXPECT_FALSE(ReceiveFrame());
++  DeliverEncoding(1);
++  WaitForFrame();
++  WaitIdle();
 +  Tick();
-+  Tick();
-+  Tick();
-+  base::RunLoop().RunUntilIdle();
-+  EXPECT_EQ(1, requests_);
-+  ASSERT_TRUE(factory_.SimulateResponseForPendingRequest(
-+      endpoint_.spec(), "", net::HTTP_SERVICE_UNAVAILABLE));
-+  ASSERT_TRUE(base::test::RunUntil([&] { return Idle(); }));
-+  Tick();
-+  WaitForRequests(2);
++  WaitForFrame();
 +}
 +
 +IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
@@ -581,17 +629,14 @@ index 0000000000..d36e18b9e8
 +  ASSERT_TRUE(ui_test_utils::NavigateToURL(
 +      browser(),
 +      GURL("data:text/html,<body style='background:green'>new page")));
-+  // Invalidation must keep the old encoding slot occupied until its reply.
 +  Tick();
 +  EXPECT_FALSE(Idle());
-+  EXPECT_EQ(0, requests_);
 +  DeliverEncoding(cycle);
-+  base::RunLoop().RunUntilIdle();
-+  EXPECT_EQ(0, requests_);
 +  EXPECT_TRUE(Idle());
++  EXPECT_FALSE(ReceiveFrame());
 +  content::WaitForCopyableViewInWebContents(contents_);
 +  Tick();
-+  WaitForRequests(1);
++  WaitForFrame();
 +}
 +
 +IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
@@ -601,24 +646,85 @@ index 0000000000..d36e18b9e8
 +  const uint64_t cycle = BeginSyntheticCapture(temporary.get());
 +  temporary.reset();
 +  DeliverEncoding(cycle);
-+  base::RunLoop().RunUntilIdle();
-+  EXPECT_EQ(0, requests_);
 +  EXPECT_TRUE(Idle());
++  EXPECT_FALSE(ReceiveFrame());
 +  Tick();
-+  WaitForRequests(1);
++  WaitForFrame();
 +}
 +
 +IN_PROC_BROWSER_TEST_F(PageFrameStreamerBrowserTest,
-+                       ShutdownCancelsPendingUpload) {
-+  Tick();
-+  WaitForRequests(1);
-+  streamer_->PostMainMessageLoopRun();
-+  base::RunLoop().RunUntilIdle();
-+  EXPECT_TRUE(Idle());
-+  EXPECT_EQ(1, requests_);
++                       ShutdownCancelsPendingSend) {
++  BeginSyntheticCapture(contents_);
++  ExpectCancelledOnShutdown();
++  EXPECT_FALSE(ReceiveFrame());
 +}
 +
 +}  // namespace observer
+diff --git a/chrome/browser/observer/udp_frame_protocol.h b/chrome/browser/observer/udp_frame_protocol.h
+new file mode 100644
+index 0000000000..efabb44061
+--- /dev/null
++++ b/chrome/browser/observer/udp_frame_protocol.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 Chromium Observer Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the Chromium LICENSE file.
++
++#ifndef CHROME_BROWSER_OBSERVER_UDP_FRAME_PROTOCOL_H_
++#define CHROME_BROWSER_OBSERVER_UDP_FRAME_PROTOCOL_H_
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <string_view>
++#include <vector>
++
++namespace observer::udp {
++
++inline constexpr size_t kDatagramBytes = 1200;
++inline constexpr size_t kHeaderBytes = 68;
++inline constexpr size_t kPayloadBytes = kDatagramBytes - kHeaderBytes;
++inline constexpr size_t kMaxFrameBytes = 32 * 1024 * 1024;
++
++// COU1, ASCII UUID, sequence, capture time (Unix ms), JPEG size,
++// chunk index/count, CRC32. Integers use network byte order.
++inline std::vector<uint8_t> MakeDatagram(std::string_view session,
++                                         uint64_t sequence,
++                                         uint64_t captured_ms,
++                                         std::span<const uint8_t> jpeg,
++                                         size_t index,
++                                         uint32_t checksum) {
++  const size_t count = (jpeg.size() + kPayloadBytes - 1) / kPayloadBytes;
++  if (session.size() != 36 || !sequence || !captured_ms || jpeg.size() < 4 ||
++      jpeg.size() > kMaxFrameBytes || index >= count) {
++    return {};
++  }
++  const auto payload = jpeg.subspan(
++      index * kPayloadBytes,
++      std::min(kPayloadBytes, jpeg.size() - index * kPayloadBytes));
++  std::vector<uint8_t> result(kHeaderBytes + payload.size());
++  std::copy_n("COU1", 4, result.begin());
++  std::copy(session.begin(), session.end(), result.begin() + 4);
++  auto write = [&](size_t offset, uint64_t value, size_t bytes) {
++    for (size_t n = 0; n < bytes; ++n) {
++      result[offset + bytes - 1 - n] = static_cast<uint8_t>(value & 0xff);
++      value >>= 8;
++    }
++  };
++  write(40, sequence, 8);
++  write(48, captured_ms, 8);
++  write(56, jpeg.size(), 4);
++  write(60, index, 2);
++  write(62, count, 2);
++  write(64, checksum, 4);
++  std::copy(payload.begin(), payload.end(), result.begin() + kHeaderBytes);
++  return result;
++}
++
++}  // namespace observer::udp
++
++#endif  // CHROME_BROWSER_OBSERVER_UDP_FRAME_PROTOCOL_H_
 diff --git a/chrome/test/BUILD.gn b/chrome/test/BUILD.gn
 index 167b043f9a..297f61e222 100644
 --- a/chrome/test/BUILD.gn

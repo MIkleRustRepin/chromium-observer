@@ -5,6 +5,7 @@
 #ifndef CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
 #define CHROME_BROWSER_OBSERVER_PAGE_FRAME_STREAMER_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -18,15 +19,6 @@
 #include "chrome/browser/chrome_browser_main_extra_parts.h"
 #include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents_observer.h"
-#include "url/gurl.h"
-
-namespace net {
-class HttpResponseHeaders;
-}
-namespace network {
-class SharedURLLoaderFactory;
-class SimpleURLLoader;
-}  // namespace network
 
 namespace observer {
 
@@ -35,7 +27,7 @@ class PageFrameStreamer : public ChromeBrowserMainExtraParts,
                           public content::WebContentsObserver {
  public:
   PageFrameStreamer();
-  explicit PageFrameStreamer(const GURL& endpoint);
+  explicit PageFrameStreamer(std::string endpoint);
   ~PageFrameStreamer() override;
 
   void PostBrowserStart() override;
@@ -54,20 +46,18 @@ class PageFrameStreamer : public ChromeBrowserMainExtraParts,
   void OnEncoded(uint64_t cycle,
                  base::Time captured_at,
                  std::optional<std::vector<uint8_t>> jpeg);
-  void OnUploaded(uint64_t cycle,
-                  scoped_refptr<net::HttpResponseHeaders> headers);
+  void OnSent(uint64_t cycle, bool sent);
 
   void DidStartNavigation(content::NavigationHandle* navigation) override;
   void WebContentsDestroyed() override;
 
-  const GURL endpoint_;
+  const std::string endpoint_;
   const std::string session_;
   uint64_t next_cycle_ = 0;
   uint64_t active_cycle_ = 0;
   bool invalidated_ = false;
   base::RepeatingTimer timer_;
-  scoped_refptr<network::SharedURLLoaderFactory> factory_;
-  std::unique_ptr<network::SimpleURLLoader> upload_;
+  std::shared_ptr<std::atomic_bool> send_cancel_;
   base::WeakPtrFactory<PageFrameStreamer> weak_factory_{this};
 };
 
