@@ -12,6 +12,7 @@ import time
 from urllib.parse import urlparse
 
 from devtools_types import prepare_devtools_types
+from build_isolation import isolate_build_command
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "chromium" / "src"
@@ -53,6 +54,7 @@ if args.generate_only:
     sys.exit(0)
 targets = (args.target or ["chrome"]) + (["browser_tests"] if args.tests else [])
 command = ["autoninja", "-C", "out/Observer", "-j", str(args.jobs), *targets]
+command = isolate_build_command(command, SRC)
 process = subprocess.Popen(command, cwd=SRC, env=env, start_new_session=True)
 try:
     while process.poll() is None:

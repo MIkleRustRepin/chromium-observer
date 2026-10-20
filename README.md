@@ -28,6 +28,8 @@ python3 scripts/build.py
 python3 scripts/package.py
 ```
 
+На Linux, если выше каталога Chromium есть `node_modules`, скрипт сборки скрывает их только от своего процесса через `bubblewrap` (`sudo apt install bubblewrap`). Это предотвращает подхватывание домашних пакетов TypeScript; файлы на хосте сохраняются.
+
 ## Локальный запуск
 
 В одном терминале:
